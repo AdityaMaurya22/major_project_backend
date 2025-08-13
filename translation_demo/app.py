@@ -10,22 +10,28 @@ import torch
 
 # Auto-detect GPU
 USE_GPU = torch.cuda.is_available()
-model = whisper.load_model("large-v2" if USE_GPU else "small")
+MODEL_NAME = "large-v3" if USE_GPU else "small"
+model = whisper.load_model(MODEL_NAME)
 
-# Translation function
-def translate(text, lang="hi"):
+# Translation function (Google)
+def translate_google(text, lang="hi"):
     try:
-        return GoogleTranslator(source="auto", target=lang).translate(text)
+        sentences = text.split(". ")
+        translated_sentences = [
+            GoogleTranslator(source="en", target=lang).translate(s)
+            for s in sentences if s.strip()
+        ]
+        return ". ".join(translated_sentences)
     except Exception as e:
         return f"Translation failed: {e}"
 
-# Clean audio with aggressive filters
+# Clean audio
 def clean_audio(path):
     cleaned = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
     (
         ffmpeg
         .input(path)
-        .output(cleaned, af="highpass=f=200, lowpass=f=3000, dynaudnorm", ar='16000', ac=1)
+        .output(cleaned, af="highpass=f=100, lowpass=f=8000, dynaudnorm", ar='16000', ac=1)
         .overwrite_output()
         .run(quiet=True)
     )
@@ -43,33 +49,37 @@ def extract_audio(path):
     )
     return audio_path
 
-# Transcribe with Whisper
-def transcribe(path):
-    return model.transcribe(path, fp16=USE_GPU)["text"]
+# Whisper: transcribe in same language
+def whisper_transcribe(path):
+    return model.transcribe(path, task="transcribe", fp16=USE_GPU)["text"]
 
-# TTS with gTTS or fallback to pyttsx3
+# Whisper: translate to English
+def whisper_translate(path):
+    return model.transcribe(path, task="translate", fp16=USE_GPU)["text"]
+
+# TTS
 def tts(text, lang="hi"):
     speech_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
     try:
-        gTTS(text=text, lang=lang).save(speech_path)
+        gTTS(text=text, lang=lang, slow=False).save(speech_path)
     except:
         engine = pyttsx3.init()
         engine.save_to_file(text, speech_path)
         engine.runAndWait()
     return speech_path
 
-# Match TTS to video duration (smart sync)
+# Match audio duration to video
 def match_audio_to_video(audio_path, video_duration):
     try:
         audio_duration = float(ffmpeg.probe(audio_path)["format"]["duration"])
     except:
-        return audio_path  # fallback
+        return audio_path
 
     if abs(audio_duration - video_duration) < 0.5:
         return audio_path
 
     tempo = audio_duration / video_duration
-    tempo = max(0.5, min(2.0, tempo))  # FFmpeg atempo supports 0.5–2.0
+    tempo = max(0.5, min(2.0, tempo))
 
     adjusted_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
     (
@@ -89,7 +99,7 @@ def get_duration(path):
     except:
         return 0
 
-# Merge audio & video
+# Merge audio with video
 def merge_audio_video(video_path, audio_path):
     output = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
     video = ffmpeg.input(video_path).video
@@ -107,12 +117,14 @@ def merge_audio_video(video_path, audio_path):
 lang_options = {
     "English": "en", "Hindi": "hi", "Bengali": "bn", "Tamil": "ta", "Telugu": "te",
     "Marathi": "mr", "Gujarati": "gu", "Kannada": "kn", "Malayalam": "ml", "Punjabi": "pa",
-    "Urdu": "ur", "Spanish": "es", "French": "fr", "German": "de", "Japanese": "ja", "Arabic": "ar"
+    "Urdu": "ur", "Spanish": "es", "French": "fr", "German": "de", "Japanese": "ja", "Arabic": "ar","Italian": "it","Nepali": "ne",
+    "Portuguese": "pt","Russian": "ru","Tamil": "ta","Telugu": "te"
+
 }
 
 # Streamlit UI
 st.set_page_config(page_title="🎙️ Fast Translator", layout="centered")
-st.title("🎬 Translate & Dub Media")
+st.title("🎬 Translate & Dub Media (Dual Whisper Mode)")
 
 file = st.file_uploader("📤 Upload video/audio", type=["mp4", "mov", "mkv", "mp3", "wav", "m4a"])
 lang_name = st.selectbox("🌍 Choose Target Language", list(lang_options.keys()))
@@ -135,24 +147,22 @@ if file:
         # Step 2: Clean audio
         cleaned_audio = clean_audio(raw_audio)
 
-        # Step 3: Transcribe
-        transcript = transcribe(cleaned_audio)
+        # Step 3: Whisper transcription (same language)
+        original_transcript = whisper_transcribe(cleaned_audio)
 
-        # Step 4: Heuristic check for poor transcript
-        if len(transcript.strip()) < 10 or "[INAUDIBLE]" in transcript or transcript.count(" ") < 5:
-            st.warning("⚠️ Audio may be unclear. Re-cleaning and retrying transcription...")
-            cleaned_audio = clean_audio(cleaned_audio)
-            transcript = transcribe(cleaned_audio)
+        # Step 4: Whisper English translation
+        whisper_english = whisper_translate(cleaned_audio)
 
-        # Step 5: Translate
-        translation = translate(transcript, lang=lang_code)
+        # Step 5: Google translation from English to target
+        final_translation = translate_google(whisper_english, lang=lang_code)
 
         # Step 6: TTS
-        tts_path = tts(translation, lang=lang_code)
+        tts_path = tts(final_translation, lang=lang_code)
 
         # Step 7: Display results
-        st.text_area("📝 Transcript", transcript, height=150)
-        st.text_area("🌐 Translation", translation, height=150)
+        st.text_area("📝 Original Transcript", original_transcript, height=150)
+        st.text_area("🇬🇧 Whisper English Translation", whisper_english, height=150)
+        st.text_area("🌐 Final Target Translation", final_translation, height=150)
         st.audio(tts_path)
 
         with open(tts_path, "rb") as f:
