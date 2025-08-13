@@ -1,24 +1,33 @@
 import streamlit as st
 import tempfile
 import whisper
-from googletrans import Translator
+from deep_translator import GoogleTranslator
 from gtts import gTTS
+import pyttsx3
 import os
 import ffmpeg
+import torch
 
-# Load Whisper base model (faster)
-model = whisper.load_model("base")
-translator = Translator()
+# Auto-detect GPU
+USE_GPU = torch.cuda.is_available()
+model = whisper.load_model("large-v2" if USE_GPU else "small")
 
-# Optional: Clean noisy audio
+# Translation function
+def translate(text, lang="hi"):
+    try:
+        return GoogleTranslator(source="auto", target=lang).translate(text)
+    except Exception as e:
+        return f"Translation failed: {e}"
+
+# Clean audio with aggressive filters
 def clean_audio(path):
     cleaned = tempfile.NamedTemporaryFile(delete=False, suffix=".wav").name
     (
         ffmpeg
         .input(path)
-        .output(cleaned, af="highpass=f=200, lowpass=f=3000", ar='16000', ac=1)
+        .output(cleaned, af="highpass=f=200, lowpass=f=3000, dynaudnorm", ar='16000', ac=1)
         .overwrite_output()
-        .run()
+        .run(quiet=True)
     )
     return cleaned
 
@@ -30,36 +39,48 @@ def extract_audio(path):
         .input(path)
         .output(audio_path, ar="16000", ac=1, format="wav")
         .overwrite_output()
-        .run()
+        .run(quiet=True)
     )
     return audio_path
 
 # Transcribe with Whisper
 def transcribe(path):
-    return model.transcribe(path)["text"]
+    return model.transcribe(path, fp16=USE_GPU)["text"]
 
-# Translate with Google Translate
-def translate(text, lang="hi"):
-    return translator.translate(text, dest=lang).text
-
-# TTS with gTTS
+# TTS with gTTS or fallback to pyttsx3
 def tts(text, lang="hi"):
     speech_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
-    gTTS(text=text, lang=lang).save(speech_path)
+    try:
+        gTTS(text=text, lang=lang).save(speech_path)
+    except:
+        engine = pyttsx3.init()
+        engine.save_to_file(text, speech_path)
+        engine.runAndWait()
     return speech_path
 
-# Match TTS to video duration
-def match_audio_to_video(audio, video_duration):
-    fitted = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
+# Match TTS to video duration (smart sync)
+def match_audio_to_video(audio_path, video_duration):
+    try:
+        audio_duration = float(ffmpeg.probe(audio_path)["format"]["duration"])
+    except:
+        return audio_path  # fallback
+
+    if abs(audio_duration - video_duration) < 0.5:
+        return audio_path
+
+    tempo = audio_duration / video_duration
+    tempo = max(0.5, min(2.0, tempo))  # FFmpeg atempo supports 0.5–2.0
+
+    adjusted_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3").name
     (
         ffmpeg
-        .input(audio)
-        .filter("atempo", 1.25)  # Adjust tempo slightly
-        .output(fitted, t=video_duration)
+        .input(audio_path)
+        .filter("atempo", tempo)
+        .output(adjusted_path)
         .overwrite_output()
-        .run()
+        .run(quiet=True)
     )
-    return fitted
+    return adjusted_path
 
 # Get duration
 def get_duration(path):
@@ -78,28 +99,15 @@ def merge_audio_video(video_path, audio_path):
         .output(video, audio, output, c='copy')
         .global_args("-shortest")
         .overwrite_output()
-        .run()
+        .run(quiet=True)
     )
     return output
 
-# Language options (Indian + global)
+# Language options
 lang_options = {
-    "English": "en",
-    "Hindi": "hi",
-    "Bengali": "bn",
-    "Tamil": "ta",
-    "Telugu": "te",
-    "Marathi": "mr",
-    "Gujarati": "gu",
-    "Kannada": "kn",
-    "Malayalam": "ml",
-    "Punjabi": "pa",
-    "Urdu": "ur",
-    "Spanish": "es",
-    "French": "fr",
-    "German": "de",
-    "Japanese": "ja",
-    "Arabic": "ar"
+    "English": "en", "Hindi": "hi", "Bengali": "bn", "Tamil": "ta", "Telugu": "te",
+    "Marathi": "mr", "Gujarati": "gu", "Kannada": "kn", "Malayalam": "ml", "Punjabi": "pa",
+    "Urdu": "ur", "Spanish": "es", "French": "fr", "German": "de", "Japanese": "ja", "Arabic": "ar"
 }
 
 # Streamlit UI
@@ -121,20 +129,28 @@ if file:
     st.info("🔄 Processing, please wait...")
 
     try:
-        # Step 1: Extract or clean audio
+        # Step 1: Extract audio if video
         raw_audio = extract_audio(input_path) if is_video else input_path
-        processed_audio = clean_audio(raw_audio)
 
-        # Step 2: Transcription
-        transcript = transcribe(processed_audio)
+        # Step 2: Clean audio
+        cleaned_audio = clean_audio(raw_audio)
 
-        # Step 3: Translation
+        # Step 3: Transcribe
+        transcript = transcribe(cleaned_audio)
+
+        # Step 4: Heuristic check for poor transcript
+        if len(transcript.strip()) < 10 or "[INAUDIBLE]" in transcript or transcript.count(" ") < 5:
+            st.warning("⚠️ Audio may be unclear. Re-cleaning and retrying transcription...")
+            cleaned_audio = clean_audio(cleaned_audio)
+            transcript = transcribe(cleaned_audio)
+
+        # Step 5: Translate
         translation = translate(transcript, lang=lang_code)
 
-        # Step 4: TTS
+        # Step 6: TTS
         tts_path = tts(translation, lang=lang_code)
 
-        # Step 5: Sync audio to video if needed
+        # Step 7: Display results
         st.text_area("📝 Transcript", transcript, height=150)
         st.text_area("🌐 Translation", translation, height=150)
         st.audio(tts_path)
@@ -142,10 +158,11 @@ if file:
         with open(tts_path, "rb") as f:
             st.download_button("🔊 Download Translated Audio", data=f, file_name="translated_audio.mp3", mime="audio/mp3")
 
+        # Step 8: Merge with video
         if is_video:
             duration = get_duration(input_path)
-            fitted_audio = match_audio_to_video(tts_path, duration)
-            final_video = merge_audio_video(input_path, fitted_audio)
+            synced_audio = match_audio_to_video(tts_path, duration)
+            final_video = merge_audio_video(input_path, synced_audio)
             st.video(final_video)
             with open(final_video, "rb") as f:
                 st.download_button("🎞️ Download Dubbed Video", data=f, file_name="translated_video.mp4", mime="video/mp4")
